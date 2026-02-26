@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Drive</title>
+    <link rel="icon" type="image/png" href="sanzu.png">
+    <style>
+        body { 
+            margin: 0; 
+            overflow: hidden; 
+            background: linear-gradient(to bottom, #4A90E2, #1E3A8A); 
+            font-family: 'Comic Sans MS', cursive; 
+            color: #000;
+        }
+        canvas { display: block; }
+        #ui {
+            position: absolute; 
+            top: 20px; 
+            left: 20px; 
+            background: #ffffff;
+            color: #000000;
+            padding: 20px;
+            border-radius: 12px;
+            z-index: 10;
+            max-width: 320px;
+        }
+        h1 { 
+            margin: 0; 
+            font-size: 2rem; 
+            text-align: center;
+            color: #000000;
+            border: none;
+            border-bottom: 1px solid rgb(0, 0, 0);
+            padding-bottom: 5px;
+            margin: 20px 0;
+        }
+        p { 
+            font-size: 1.2rem; 
+            text-align: center;
+            margin: 12px 0;
+            color: #000000;
+        }
+        #score {
+            font-size: 1.5rem;
+            text-align: center;
+            color: #000000;
+            font-weight: bold;
+        }
+        #restart {
+            display: none;
+            font-family: 'Comic Sans MS', cursive;
+            font-size: 1.5rem;
+            padding: 10px 20px;
+            margin: 10px auto;
+            background: #000000;
+            color: #ffffff;
+            border-radius: 12px;
+            cursor: pointer;
+            text-align: center;
+            pointer-events: all;
+        }
+        #restart:hover {
+            background: #ffffff;
+            color: #000000;
+        }
+        #loading {
+            position: absolute; 
+            top: 50%; 
+            left: 50%; 
+            transform: translate(-50%, -50%);
+            background: #ffffff;
+            color: #000000;
+            font-size: 2.5rem; 
+            padding: 30px 50px;
+            border-radius: 12px;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="ui">
+        <h1>Drive</h1>
+        <p>🖐 Tilt hand → STEER</p>
+        <p>Keep your hand visible to drive!</p>
+        <p>Collect boosts, avoid rocks!</p>
+        <div id="score">Score: 0</div>
+        <button id="restart" onclick="restartGame()">Restart</button>
+    </div>
+    <div id="loading">Loading camera...</div>
+
+    <script>
+        // === GAME VARIABLES ===
+        let score = 0;
+        let gameOver = false;
+        let carX = 0;
+        let velocityX = 0;
+        const SPEED = 0.6;
+        const STEER_SENSITIVITY = 0.12;
+        const ROAD_WIDTH = 20;
+        const boosts = [];
+        const rocks = [];
+        const stripes = [];
+        const BOOST_GAP = 250;
+        const ROCK_GAP = 200;
+        const STRIPE_SPACING = 20;
+
+        // === THREE.JS SETUP ===
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 5, 15);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+        dirLight.position.set(10, 20, 10);
+        scene.add(dirLight);
+
+        // Sun
+        const sunGeo = new THREE.SphereGeometry(8, 32, 32);
+        const sunMat = new THREE.MeshBasicMaterial({ color: 0xFFFF00 });
+        const sun = new THREE.Mesh(sunGeo, sunMat);
+        sun.position.set(40, 30, -200);
+        scene.add(sun);
+        const sunLight = new THREE.PointLight(0xFFFF00, 2, 500);
+        sunLight.position.copy(sun.position);
+        scene.add(sunLight);
+
+        // Road
+        const roadGeo = new THREE.PlaneGeometry(ROAD_WIDTH, 10000);
+        const roadMat = new THREE.MeshLambertMaterial({ color: 0x333333 });
+        const road = new THREE.Mesh(roadGeo, roadMat);
+        road.rotation.x = -Math.PI / 2;
+        road.position.y = -0.1;
+        scene.add(road);
+
+        // Footpaths (sidewalks)
+        const footpathWidth = 5;
+        const footpathGeo = new THREE.PlaneGeometry(footpathWidth, 10000);
+        const footpathMat = new THREE.MeshLambertMaterial({ color: 0x000000 });
+        
+        const leftFootpath = new THREE.Mesh(footpathGeo, footpathMat);
+        leftFootpath.rotation.x = -Math.PI / 2;
+        leftFootpath.position.set(-(ROAD_WIDTH/2 + footpathWidth/2), -0.5, 0);
+        scene.add(leftFootpath);
+        
+        const rightFootpath = new THREE.Mesh(footpathGeo, footpathMat);
+        rightFootpath.rotation.x = -Math.PI / 2;
+        rightFootpath.position.set((ROAD_WIDTH/2 + footpathWidth/2), -0.5, 0);
+        scene.add(rightFootpath);
+
+        // Moving road stripes
+        function createStripes() {
+            const stripeGeo = new THREE.PlaneGeometry(0.5, 10);
+            const stripeMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+            for (let i = 0; i < 50; i++) {
+                const stripe = new THREE.Mesh(stripeGeo, stripeMat);
+                stripe.rotation.x = -Math.PI / 2;
+                stripe.position.set(0, 0.01, -i * STRIPE_SPACING);
+                scene.add(stripe);
+                stripes.push(stripe);
+            }
+        }
+        createStripes();
+
+        // Player Car
+        const carGroup = new THREE.Group();
+        const carBodyGeo = new THREE.BoxGeometry(2, 1, 4);
+        const carBodyMat = new THREE.MeshLambertMaterial({ color: 0x0070C0 });
+        const carBody = new THREE.Mesh(carBodyGeo, carBodyMat);
+        carGroup.add(carBody);
+
+        // Wheels
+        const wheelGeo = new THREE.CylinderGeometry(0.4, 0.4, 0.3, 16);
+        const wheelMat = new THREE.MeshLambertMaterial({ color: 0x000000 });
+        for (let i = 0; i < 4; i++) {
+            const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+            wheel.rotation.z = Math.PI / 2;
+            wheel.position.set(
+                (i % 2 ? -1 : 1) * 0.8,
+                -0.5,
+                (i < 2 ? 1 : -1) * 1.2
+            );
+            carGroup.add(wheel);
+        }
+
+        carGroup.position.set(0, 1, 0);
+        scene.add(carGroup);
+
+      function createBoost(z) {
+    // Generate a random hex color
+        const randomColor = Math.random() * 0xffffff;    
+        const geo = new THREE.SphereGeometry(1, 16, 16);
+    // Use the randomColor variable here
+        const mat = new THREE.MeshLambertMaterial({ color: randomColor });    
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.position.set((Math.random() - 0.5) * (ROAD_WIDTH - 2), 1, z);
+        scene.add(mesh);
+        boosts.push({ mesh, z });
+}
+
+        // Rock Creator
+        function createRock(z) {
+            const isStone = Math.random() > 0.5;
+            const size = isStone ? 1.5 : 2.5;
+            const geo = new THREE.DodecahedronGeometry(size, 0);
+            const mat = new THREE.MeshLambertMaterial({ color: isStone ? 0x888888 : 0x292929 });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.position.set(
+                (Math.random() - 0.5) * (ROAD_WIDTH - 4),
+                size,
+                z
+            );
+            scene.add(mesh);
+            rocks.push({ mesh, z, size });
+        }
+
+        createBoost(-50);
+        createRock(-100);
+
+        // === MEDIAPIPE HANDS ===
+        const video = document.createElement('video');
+        let handTilt = 0;
+        let lastHandTime = performance.now();
+        const HAND_TIMEOUT = 1000;
+
+        function onResults(results) {
+            const now = performance.now();
+            document.getElementById('loading').style.display = 'none';
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                lastHandTime = now;
+                const lm = results.multiHandLandmarks[0];
+
+                // Hand tilt for steering
+                const wristX = lm[0].x;
+                const middleMCPX = lm[9].x;
+                const targetTilt = -(middleMCPX - wristX) * 7;
+                handTilt += (targetTilt - handTilt) * 0.4;
+            } else if (now - lastHandTime < HAND_TIMEOUT) {
+                handTilt += (0 - handTilt) * 0.05;
+            } else {
+                handTilt = 0;
+            }
+        }
+
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 0,
+            minDetectionConfidence: 0.85,
+            minTrackingConfidence: 0.85
+        });
+        hands.onResults(onResults);
+
+        const cameraUtils = new Camera(video, {
+            onFrame: async () => await hands.send({ image: video }),
+            width: 480,
+            height: 360
+        });
+        cameraUtils.start();
+
+        // === GAME LOGIC ===
+        function restartGame() {
+            score = 0;
+            gameOver = false;
+            carX = 0;
+            velocityX = 0;
+            handTilt = 0;
+            document.getElementById('score').innerText = `Score: ${score}`;
+            document.getElementById('restart').style.display = 'none';
+
+            boosts.forEach(({ mesh }) => scene.remove(mesh));
+            rocks.forEach(({ mesh }) => scene.remove(mesh));
+            boosts.length = 0;
+            rocks.length = 0;
+            createBoost(-50);
+            createRock(-100);
+
+            stripes.forEach((stripe, i) => {
+                stripe.position.z = -i * STRIPE_SPACING;
+            });
+
+            const ui = document.getElementById('ui');
+            ui.innerHTML = `
+                <h1>Drive</h1>
+                <p>🖐 Tilt hand → STEER</p>
+                <p>Keep your hand visible to drive!</p>
+                <p>Collect boosts, avoid rocks!</p>
+                <div id="score">Score: 0</div>
+                <button id="restart" onclick="restartGame()">Restart</button>
+            `;
+
+            animate();
+        }
+
+        // === ANIMATION LOOP ===
+        const clock = new THREE.Clock();
+
+        function animate() {
+            if (gameOver) return;
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+
+            // Steering
+            velocityX += handTilt * STEER_SENSITIVITY * delta * 60;
+            velocityX *= 0.8;
+            carX += velocityX * delta * 60;
+            carX = Math.max(-ROAD_WIDTH / 2 + 1, Math.min(ROAD_WIDTH / 2 - 1, carX));
+            carGroup.position.x = carX;
+
+            const forwardSpeed = SPEED * delta * 60;
+
+            // Move road stripes
+            stripes.forEach(stripe => {
+                stripe.position.z += forwardSpeed;
+                if (stripe.position.z > 10) {
+                    stripe.position.z -= stripes.length * STRIPE_SPACING;
+                }
+            });
+
+            // Move boosts
+            let i = 0;
+            while (i < boosts.length) {
+                const boost = boosts[i];
+                boost.z += forwardSpeed;
+                boost.mesh.position.z = boost.z;
+                if (boost.z > 10) {
+                    scene.remove(boost.mesh);
+                    boosts.splice(i, 1);
+                    continue;
+                }
+                if (Math.abs(boost.mesh.position.x - carX) < 2 && Math.abs(boost.z) < 2) {
+                    scene.remove(boost.mesh);
+                    boosts.splice(i, 1);
+                    score += 10;
+                    document.getElementById('score').innerText = `Score: ${score}`;
+                    continue;
+                }
+                i++;
+            }
+
+            // Move rocks
+            i = 0;
+            while (i < rocks.length) {
+                const rock = rocks[i];
+                rock.z += forwardSpeed;
+                rock.mesh.position.z = rock.z;
+                if (rock.z > 10) {
+                    scene.remove(rock.mesh);
+                    rocks.splice(i, 1);
+                    continue;
+                }
+                if (Math.abs(rock.mesh.position.x - carX) < 2 && Math.abs(rock.z) < 2) {
+                    gameOver = true;
+                    document.getElementById('restart').style.display = 'block';
+                    document.getElementById('ui').innerHTML += '<p style="font-size:2rem;color:#000;">GAME OVER!</p>';
+                    document.getElementById('ui').innerHTML += '<p style="font-size:1rem;color:#000;">by Sanzu</p>';
+                    return;
+                }
+                i++;
+            }
+
+            // Spawn new boosts and rocks
+            if (boosts.length === 0) {
+                createBoost(-50);
+            } else if (boosts[boosts.length - 1].z > -500) {
+                createBoost(boosts[boosts.length - 1].z - BOOST_GAP);
+            }
+            if (rocks.length === 0) {
+                createRock(-100);
+            } else if (rocks[rocks.length - 1].z > -500) {
+                createRock(rocks[rocks.length - 1].z - ROCK_GAP);
+            }
+
+            // Camera follows car
+            camera.position.z = carGroup.position.z + 15;
+            camera.position.x = carGroup.position.x * 0.5;
+            camera.lookAt(carGroup.position.x * 0.5, 1, carGroup.position.z);
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+
+        // Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
